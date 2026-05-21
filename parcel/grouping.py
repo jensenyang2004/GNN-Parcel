@@ -160,6 +160,57 @@ def union_grouping_masks(masks):
     return result
 
 
+def build_edge_weights(groups, start_positions, ralloc, N, device):
+    """
+    Build NxN edge feature matrix for the edge-encoded GCN critic.
+
+    Each edge (i→j) carries a 3-dim feature vector [dr, dc, w]:
+        dr = (row_j - row_i) / denom   signed normalized row displacement
+        dc = (col_j - col_i) / denom   signed normalized col displacement
+        w  = max(0, 1 - |dr| - |dc|)  proximity weight (same as before)
+
+    Agents in different groups get [0, 0, 0].
+    Self-loops get [0, 0, 1] (no direction, max proximity).
+
+    The directional components let the critic learn to attend differently
+    based on where a neighbor is relative to the agent — e.g. attend more
+    to agents that are ahead in the direction of intended movement.
+
+    Args:
+        groups:          list of sets of agent indices
+        start_positions: list of (row, col) tuples, length N
+        ralloc:          int, current allocation radius
+        N:               total number of agents
+        device:          torch device
+
+    Returns:
+        FloatTensor [N, N, 3]  — axis 2 is (dr, dc, w)
+    """
+    features = torch.zeros(N, N, 3, dtype=torch.float32, device=device)
+
+    # Self-loops: no direction, max proximity
+    for i in range(N):
+        features[i, i, 2] = 1.0
+
+    denom = max(2 * ralloc, 1)  # avoid division by zero at ralloc=0
+    for group in groups:
+        group_list = list(group)
+        for i in group_list:
+            for j in group_list:
+                if i == j:
+                    continue
+                ri, ci = start_positions[i]
+                rj, cj = start_positions[j]
+                dr = (rj - ri) / denom
+                dc = (cj - ci) / denom
+                w = max(0.0, 1.0 - abs(dr) - abs(dc))
+                features[i, j, 0] = dr
+                features[i, j, 1] = dc
+                features[i, j, 2] = w
+
+    return features
+
+
 def group_summary(groups, N):
     """
     Human-readable summary of current grouping.

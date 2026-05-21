@@ -218,7 +218,7 @@ class MaskedAttentionCritic:
     def load_model_weights(self, path):
         from os.path import join
         self.q_net.load_state_dict(
-            torch.load(join(path, "critic_net.pth"), map_location=self.device)
+            torch.load(join(path, "critic_net.pth"), map_location=self.device, weights_only=True)
         )
         self.q_net.eval()
 

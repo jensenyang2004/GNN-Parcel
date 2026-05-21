@@ -30,8 +30,12 @@ from cactus.data import save_json
 from cactus.env.mapf_gridworld import MAPFGridWorld
 
 from parcel.parcel_controller import (
-    PARCELController, PARCEL_RALLOC, PARCEL_ROWS, PARCEL_COLS, PARCEL_OBSTACLE_MAP
+    PARCELController, PARCEL_RALLOC, PARCEL_ROWS, PARCEL_COLS, PARCEL_OBSTACLE_MAP,
+    PARCEL_CRITIC_TYPE
 )
+from parcel.gnn_critic import GNN_NR_LAYERS, GNN_EMBED_DIM
+from parcel.edge_gnn_critic import EDGE_GNN_NR_LAYERS, EDGE_GNN_EMBED_DIM, EDGE_GNN_EDGE_DIM
+from parcel.mlflow_logger import PARCELLogger
 
 
 # -----------------------------------------------------------------------
@@ -85,7 +89,7 @@ def crop_subgrid(obstacle_map, crop_size=64):
     return arr.tolist()
 
 
-def make_env_from_obstacles(obstacle_list, nr_agents, time_limit, device):
+def make_env_from_obstacles(obstacle_list, nr_agents, time_limit, device, goal_radius=2):
     """Create a MAPFGridWorld from a 2D obstacle list."""
     return MAPFGridWorld({
         ENV_OBSTACLES: torch.tensor(obstacle_list, dtype=torch.bool),
@@ -94,7 +98,7 @@ def make_env_from_obstacles(obstacle_list, nr_agents, time_limit, device):
         ENV_GAMMA: 1,
         ENV_OBSERVATION_SIZE: 7,
         TORCH_DEVICE: device,
-        ENV_INIT_GOAL_RADIUS: 2,
+        ENV_INIT_GOAL_RADIUS: goal_radius,
     })
 
 
@@ -111,12 +115,21 @@ class CroppingMapEnv:
         self.time_limit = time_limit
         self.device = device
         self.crop_size = crop_size
+        # goal_radius=2 during curriculum training; set to None for test evaluation
+        self.goal_radius = 2
         self._refresh_env()
 
     def _refresh_env(self):
         base_map = random.choice(self.base_maps)
         crop = crop_subgrid(base_map, self.crop_size)
-        self._env = make_env_from_obstacles(crop, self.nr_agents, self.time_limit, self.device)
+        self._env = make_env_from_obstacles(
+            crop, self.nr_agents, self.time_limit, self.device,
+            goal_radius=self.goal_radius,
+        )
+
+    def set_init_goal_radius(self, r):
+        """Persist goal radius so it survives the next _refresh_env() call."""
+        self.goal_radius = r
 
     def reset(self):
         self._refresh_env()
@@ -144,7 +157,11 @@ def run_episode_parcel(env, controller, training_mode=True):
     done = False
     info = {ENV_COMPLETION_RATE: 0.0}
     while not done:
-        joint_action = controller.joint_policy(obs)
+        greedy = not training_mode
+        joint_action = controller.joint_policy(obs, greedy=greedy)
+        if not training_mode:
+            # Freeze agents that already reached their goal so they don't wander off
+            joint_action[env.is_terminated()] = WAIT
         next_obs, rewards, terminated, truncated, info = env.step(joint_action)
         done = env.is_done_all()
         if training_mode:
@@ -175,17 +192,25 @@ def run_episodes_parcel(nr_episodes, envs, controller, training_mode=True):
 
 
 def test_run_parcel(test_envs, controller):
-    """Evaluate on full-map goal distance (no radius restriction)."""
+    """
+    Evaluate on full-map goals (goal_radius=None).
+    Ralloc is NOT used here — it only affects the critic's grouping during training.
+    This measures true generalization, independent of curriculum stage.
+    """
     completion_sum = 0.0
     successes = 0.0
     for env in test_envs:
-        backup = env._env.init_goal_radius
-        env._env.set_init_goal_radius(None)
+        backup = env.goal_radius
+        env.set_init_goal_radius(None)   # persists through reset() → _refresh_env()
+        # Sanity: after reset the inner env must also have goal_radius=None
+        env._refresh_env()
+        assert env._env.init_goal_radius is None, \
+            "test_run_parcel: inner env goal_radius was not None — eval is not global!"
         result = run_episode_parcel(env, controller, training_mode=False)
         completion_sum += result[COMPLETION_RATE]
         if result[TERMINATED]:
             successes += 1
-        env._env.set_init_goal_radius(backup)
+        env.set_init_goal_radius(backup)  # restore for next training epoch
     n = len(test_envs)
     sr = successes / n
     return {
@@ -199,9 +224,8 @@ def test_run_parcel(test_envs, controller):
 # Training loop
 # -----------------------------------------------------------------------
 
-def run_training_parcel(train_envs, test_envs, controller, params):
-    inner_envs = [e._env for e in train_envs]
-    curriculum = CACTUSCurriculum(inner_envs, params)
+def run_training_parcel(train_envs, test_envs, controller, params, logger=None):
+    curriculum = CACTUSCurriculum(train_envs, params)
 
     episodes_per_epoch = params[EPISODES_PER_EPOCH]
     nr_epochs = params[NUMBER_OF_EPOCHS]
@@ -220,7 +244,6 @@ def run_training_parcel(train_envs, test_envs, controller, params):
             training_result[COMPLETION_RATE],
             training_result[SUCCESS_RATE_VARIANCE]
         )
-        # Sync ralloc to controller for spatial grouping
         controller.set_ralloc(curriculum.radius)
 
         training_result = run_episodes_parcel(
@@ -231,12 +254,24 @@ def run_training_parcel(train_envs, test_envs, controller, params):
         if epoch % log_interval == 0:
             training_time = total_time - prev_total_time
             prev_total_time = total_time
+            total_episodes = epoch * episodes_per_epoch
             test_result = test_run_parcel(test_envs, controller)
-            print(f"Epoch {epoch:4d} | Ralloc={curriculum.radius:3d} | "
-                  f"Train CR={training_result[COMPLETION_RATE]:.3f} | "
-                  f"Test CR={test_result[COMPLETION_RATE]:.3f} | "
-                  f"Test SR={test_result[SUCCESS_RATE]:.3f} | "
+
+            metrics = {
+                "train_cr": training_result[COMPLETION_RATE],
+                "test_cr":  test_result[COMPLETION_RATE],
+                "test_sr":  test_result[SUCCESS_RATE],
+                "ralloc":   float(curriculum.radius),
+            }
+            print(f"Ep {total_episodes:6d} (epoch {epoch:4d}) | Ralloc={curriculum.radius:3d} | "
+                  f"Train CR={metrics['train_cr']:.3f} | "
+                  f"Test CR={metrics['test_cr']:.3f} | "
+                  f"Test SR={metrics['test_sr']:.3f} | "
                   f"Time={training_time:.1f}s")
+
+            if logger:
+                logger.log(epoch, total_episodes, metrics)
+
             success_rates.append(float(test_result[SUCCESS_RATE]))
             completion_rates.append(float(test_result[COMPLETION_RATE]))
             training_times.append(training_time)
@@ -285,6 +320,12 @@ def main():
     parser.add_argument("--warehouse_map", type=str,
                         default="instances/warehouse.map",
                         help="Path to Warehouse map file")
+    parser.add_argument("--train_maps", type=str, nargs="+", default=None,
+                        help="Maps to train on. Defaults to both random and warehouse. "
+                             "Pass one map to train on a single map, e.g. --train_maps instances/random-64-64-10.map")
+    parser.add_argument("--test_maps", type=str, nargs="+", default=None,
+                        help="Maps to evaluate on. Defaults to same as train_maps. "
+                             "Pass a different map to test generalization, e.g. --test_maps instances/warehouse.map")
     parser.add_argument("--crop_size", type=int, default=64,
                         help="Sub-grid crop size (paper: 64x64)")
     parser.add_argument("--nr_train_envs", type=int, default=4)
@@ -308,6 +349,21 @@ def main():
     parser.add_argument("--clip_ratio", type=float, default=0.1)
     parser.add_argument("--update_iterations", type=int, default=4)
 
+    # Critic type
+    parser.add_argument("--critic_type", type=str, default="attention",
+                        choices=["attention", "gnn", "edge_gnn"],
+                        help="Critic: 'attention' (paper) | 'gnn' (plain GCN) | 'edge_gnn' (edge-encoded GCN)")
+    parser.add_argument("--gnn_layers", type=int, default=1,
+                        help="GCN layers (gnn and edge_gnn)")
+    parser.add_argument("--edge_dim", type=int, default=4,
+                        help="Edge embedding dimension (edge_gnn only)")
+
+    # MLflow
+    parser.add_argument("--experiment", type=str, default="parcel_random",
+                        help="MLflow experiment name")
+    parser.add_argument("--no_mlflow", action="store_true",
+                        help="Disable MLflow logging")
+
     # Misc
     parser.add_argument("--output_dir", type=str, default="output/parcel")
     parser.add_argument("--log_interval", type=int, default=100)
@@ -322,27 +378,37 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # --- Load benchmark maps ---
+    # --- Resolve map paths ---
+    # --train_maps / --test_maps override the old --random_map / --warehouse_map defaults
+    train_map_paths = args.train_maps or [args.random_map, args.warehouse_map]
+    test_map_paths  = args.test_maps  or train_map_paths
+
+    # --- Load maps ---
     print("\nLoading maps...")
-    for path in [args.random_map, args.warehouse_map]:
+    all_paths = set(train_map_paths + test_map_paths)
+    loaded = {}
+    for path in all_paths:
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"Map not found: {path}\n"
-                f"Run: python generate_maps.py  to generate the benchmark maps first."
+                f"Run: python generate_maps.py  to generate benchmark maps first."
             )
-    random_obstacles = load_map(args.random_map)
-    warehouse_obstacles = load_map(args.warehouse_map)
-    base_maps = [random_obstacles, warehouse_obstacles]
-    print(f"  Random map:    {len(random_obstacles)}x{len(random_obstacles[0])}")
-    print(f"  Warehouse map: {len(warehouse_obstacles)}x{len(warehouse_obstacles[0])}")
+        loaded[path] = load_map(path)
+        m = loaded[path]
+        print(f"  {os.path.basename(path):40s} {len(m)}x{len(m[0])}")
+
+    train_base_maps = [loaded[p] for p in train_map_paths]
+    test_base_maps  = [loaded[p] for p in test_map_paths]
+    print(f"  Train maps: {[os.path.basename(p) for p in train_map_paths]}")
+    print(f"  Test maps:  {[os.path.basename(p) for p in test_map_paths]}")
 
     # --- Create environments ---
     train_envs = [
-        CroppingMapEnv(base_maps, args.nr_agents, args.time_limit, device, args.crop_size)
+        CroppingMapEnv(train_base_maps, args.nr_agents, args.time_limit, device, args.crop_size)
         for _ in range(args.nr_train_envs)
     ]
     test_envs = [
-        CroppingMapEnv(base_maps, args.nr_agents, args.time_limit, device, args.crop_size)
+        CroppingMapEnv(test_base_maps, args.nr_agents, args.time_limit, device, args.crop_size)
         for _ in range(args.nr_test_envs)
     ]
     obs_dim = train_envs[0]._env.observation_dim  # [5, 7, 7]
@@ -358,8 +424,16 @@ def main():
         ENV_TIME_LIMIT: args.time_limit,
         ENV_GAMMA: 1,
         HIDDEN_LAYER_DIM: args.hidden_dim,
+        # Attention critic params
         "attention_embed_dim": args.embed_dim,
         NR_ATTENTION_HEADS: args.nr_heads,
+        # Plain GCN params
+        GNN_EMBED_DIM: args.embed_dim,
+        GNN_NR_LAYERS: args.gnn_layers,
+        # Edge GCN params
+        EDGE_GNN_EMBED_DIM: args.embed_dim,
+        EDGE_GNN_NR_LAYERS: args.gnn_layers,
+        EDGE_GNN_EDGE_DIM: args.edge_dim,
         LEARNING_RATE: args.lr,
         CLIP_RATIO: args.clip_ratio,
         UPDATE_ITERATIONS: args.update_iterations,
@@ -368,6 +442,7 @@ def main():
         PARCEL_COLS: train_envs[0]._env.columns,
         PARCEL_OBSTACLE_MAP: train_envs[0]._env.obstacle_map,
         PARCEL_RALLOC: 2,
+        PARCEL_CRITIC_TYPE: args.critic_type,
         "verbose": args.verbose,
     }
 
@@ -378,10 +453,19 @@ def main():
         train_envs[0]._env.obstacle_map,
     )
 
+    actor_params = sum(p.numel() for p in controller.policy_network.parameters() if p.requires_grad)
+    critic_params = controller.critic_network.get_parameter_count()
+    critic_desc = {
+        "attention": f"{args.nr_heads} heads, embed={args.embed_dim}",
+        "gnn":       f"{args.gnn_layers}-layer GCN, embed={args.embed_dim}",
+        "edge_gnn":  f"{args.gnn_layers}-layer Edge-GCN, embed={args.embed_dim}, edge_dim={args.edge_dim}",
+    }[args.critic_type]
     print(f"\n[PARCEL] Controller:")
     print(f"  Agents:           {args.nr_agents}")
-    print(f"  Parameters:       {controller.get_parameter_count():,}  (paper: <600,000)")
-    print(f"  Attention heads:  {args.nr_heads}, embed dim: {args.embed_dim}")
+    print(f"  Critic:           {args.critic_type}  ({critic_desc})")
+    print(f"  Actor params:     {actor_params:,}")
+    print(f"  Critic params:    {critic_params:,}")
+    print(f"  Total params:     {actor_params + critic_params:,}")
 
     # --- Training params ---
     train_params = {
@@ -407,7 +491,15 @@ def main():
     print(f"  Maps: Random-64-64-10 + Warehouse → cropped {args.crop_size}×{args.crop_size}")
     print("=" * 60)
 
-    result = run_training_parcel(train_envs, test_envs, controller, train_params)
+    logger = None
+    if not args.no_mlflow:
+        logger = PARCELLogger(experiment_name=args.experiment)
+        logger.start_run(args)
+
+    result = run_training_parcel(train_envs, test_envs, controller, train_params, logger)
+
+    if logger:
+        logger.end_run(output_dir=args.output_dir)
 
     print("\n" + "=" * 60)
     print("Training complete.")

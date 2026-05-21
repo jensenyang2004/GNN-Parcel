@@ -3,12 +3,12 @@ PARCEL Controller
 =================
 Implements Algorithm 1 of the paper:
   - Inherits episode collection and PPO actor update from A2CController
-  - Replaces the critic with MaskedAttentionCritic
+  - Replaces the critic with MaskedAttentionCritic or GNNCritic
   - Adds spatial grouping: computes grouping mask M after each epoch
   - Stores per-episode grouping information from environment start positions
 
 Key differences from base A2CController:
-  1. Uses MaskedAttentionCritic instead of standard critics
+  1. Uses MaskedAttentionCritic (default) or GNNCritic (critic_type="gnn")
   2. Computes spatial groups at episode start (via env.current_positions)
   3. Builds union grouping mask M across Y episodes each epoch
   4. Updates critic mask before training each epoch
@@ -18,6 +18,7 @@ Usage:
         ...standard params...,
         "algorithm_name": "PARCEL",
         PARCEL_GROUPING_RALLOC: 2,  # will be updated by CACTUS curriculum
+        "critic_type": "attention",  # or "gnn"
     }
     controller = PARCELController(params)
 """
@@ -27,28 +28,28 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from os.path import join
 
-from cactus.controller.a2c_controller import A2CController
 from cactus.controller.controller import Controller
 from cactus.modules.ffn_module import FFNModule
 from cactus.constants import (
-    ENV_NR_AGENTS, ENV_NR_ACTIONS, ENV_OBSERVATION_DIM,
-    HIDDEN_LAYER_DIM, NR_ATTENTION_HEADS, GRAD_NORM_CLIP,
-    LEARNING_RATE, CLIP_RATIO, UPDATE_ITERATIONS, OUTPUT_DIM,
-    ACTOR_NET_FILENAME, EPSILON, NR_GRID_ACTIONS, GRID_ACTIONS,
-    ENV_2D, WAIT
+    GRAD_NORM_CLIP, LEARNING_RATE, CLIP_RATIO, UPDATE_ITERATIONS, OUTPUT_DIM,
+    ACTOR_NET_FILENAME, EPSILON, NR_GRID_ACTIONS, GRID_ACTIONS, ENV_2D,
 )
 from cactus.utils import get_param_or_default, assertEquals
 
 from parcel.grouping import (
-    compute_groups, build_grouping_mask, union_grouping_masks, group_summary
+    compute_groups, build_grouping_mask, union_grouping_masks,
+    build_edge_weights, group_summary
 )
 from parcel.attention_critic import MaskedAttentionCritic
+from parcel.gnn_critic import GNNCritic
+from parcel.edge_gnn_critic import EdgeGNNCritic
 
 # PARCEL-specific param keys
 PARCEL_RALLOC = "parcel_ralloc"           # Current allocation radius (set by curriculum)
 PARCEL_ROWS = "parcel_rows"               # Map rows (set at init from env)
 PARCEL_COLS = "parcel_cols"               # Map cols (set at init from env)
 PARCEL_OBSTACLE_MAP = "parcel_obstacles"  # Obstacle map tensor
+PARCEL_CRITIC_TYPE = "critic_type"        # "attention" | "gnn" | "edge_gnn"
 
 
 class PARCELController(Controller):
@@ -83,12 +84,21 @@ class PARCELController(Controller):
         self.clip_ratio = get_param_or_default(params, CLIP_RATIO, 0.1)
         self.update_iterations = get_param_or_default(params, UPDATE_ITERATIONS, 4)
 
-        # --- PARCEL Attention Critic ---
-        self.critic_network = MaskedAttentionCritic(params)
+        # --- PARCEL Critic (attention | gnn | edge_gnn) ---
+        critic_type = get_param_or_default(params, PARCEL_CRITIC_TYPE, "attention")
+        self.critic_type = critic_type
+        if critic_type == "gnn":
+            self.critic_network = GNNCritic(params)
+        elif critic_type == "edge_gnn":
+            self.critic_network = EdgeGNNCritic(params)
+        else:
+            self.critic_network = MaskedAttentionCritic(params)
 
         # --- Spatial grouping state ---
-        self.episode_masks = []        # Per-episode grouping masks [N, N]
-        self.current_start_positions = None  # Set at episode start via notify_episode_start()
+        self.episode_masks = []           # Per-episode grouping masks [N, N]
+        self.episode_start_positions = [] # Per-episode start positions (for edge weights)
+        self.episode_groups = []          # Per-episode groups (cached to avoid recompute)
+        self.current_start_positions = None
 
         # Map properties (needed for BFS in grouping)
         self.ralloc = get_param_or_default(params, PARCEL_RALLOC, 2)
@@ -122,9 +132,10 @@ class PARCELController(Controller):
             start_positions: list of (row, col) tuples, length N
         """
         self.current_start_positions = start_positions
+        self.episode_start_positions.append(start_positions)
 
         if self.rows is None or self.obstacle_map is None:
-            # Map info not set yet; default to fully connected (all same group)
+            groups = [set(range(self.nr_agents))]
             mask = torch.zeros(self.nr_agents, self.nr_agents, device=self.device)
         else:
             groups = compute_groups(
@@ -137,6 +148,7 @@ class PARCELController(Controller):
                 print(f"  [PARCEL] Ralloc={self.ralloc} | {group_summary(groups, self.nr_agents)}")
 
         self.episode_masks.append(mask)
+        self.episode_groups.append(groups)
 
     def _build_epoch_mask(self):
         """
@@ -175,8 +187,12 @@ class PARCELController(Controller):
         action_mask[invalid_actions] = float('-inf')
         return action_mask.view(-1, self.nr_actions)
 
-    def joint_policy(self, joint_observation):
-        """Sample actions from the current policy (used during episode rollout)."""
+    def joint_policy(self, joint_observation, greedy=False):
+        """
+        Select actions from the current policy.
+        greedy=True: argmax (deterministic, for evaluation/visualization)
+        greedy=False: sample from distribution (stochastic, for training)
+        """
         joint_observation = joint_observation.view(1, self.nr_agents, -1)
         action_mask = self.calculate_action_masks(joint_observation)
 
@@ -184,9 +200,11 @@ class PARCELController(Controller):
         action_logits = self.policy_network(obs_flat)  # [N, nr_actions]
 
         assertEquals(action_mask.size(), action_logits.size())
-        probs = F.softmax(action_logits + action_mask, dim=-1).detach()
-        m = Categorical(probs)
-        return m.sample().view(self.nr_agents)
+        masked_logits = action_logits + action_mask
+        if greedy:
+            return masked_logits.argmax(dim=-1).view(self.nr_agents)
+        probs = F.softmax(masked_logits, dim=-1).detach()
+        return Categorical(probs).sample().view(self.nr_agents)
 
     # ------------------------------------------------------------------
     # Training
@@ -203,9 +221,20 @@ class PARCELController(Controller):
           4. Train actor with PPO using critic baseline (Eq. 2)
           5. Clear episode masks for next epoch
         """
-        # --- Step 1: Build and set grouping mask ---
+        # --- Step 1: Build and set grouping mask (+ edge weights for edge_gnn) ---
         epoch_mask = self._build_epoch_mask()
         self.critic_network.set_grouping_mask(epoch_mask)
+
+        if self.critic_type == "edge_gnn" and self.episode_start_positions:
+            # Average soft edge weights across all episodes this epoch.
+            # Use cached episode_groups to avoid recomputing BFS/union-find.
+            all_edge_w = [
+                build_edge_weights(groups, start_pos, self.ralloc,
+                                   self.nr_agents, self.device)
+                for groups, start_pos in zip(self.episode_groups, self.episode_start_positions)
+            ]
+            epoch_edge_weights = torch.stack(all_edge_w).mean(dim=0)
+            self.critic_network.set_edge_weights(epoch_edge_weights)
 
         if self.verbose:
             connected = (epoch_mask == 0.0).sum().item()
@@ -232,7 +261,7 @@ class PARCELController(Controller):
             old_probs = F.softmax(logits + action_mask, dim=-1).detach()
 
         # --- Step 4: Multiple PPO update iterations ---
-        for iteration in range(self.update_iterations):
+        for _ in range(self.update_iterations):
             # Train critic
             self.critic_network.train(obs_flat, actions_flat, returns_normalized)
 
@@ -256,8 +285,10 @@ class PARCELController(Controller):
             )
             self.policy_optimizer.step()
 
-        # --- Step 5: Clear episode masks for next epoch ---
+        # --- Step 5: Clear episode state for next epoch ---
         self.episode_masks.clear()
+        self.episode_start_positions.clear()
+        self.episode_groups.clear()
 
     def _ppo_loss(self, advantages, probs, actions, old_probs):
         """
@@ -293,7 +324,7 @@ class PARCELController(Controller):
 
     def load_model_weights(self, path):
         self.policy_network.load_state_dict(
-            torch.load(join(path, ACTOR_NET_FILENAME), map_location=self.device)
+            torch.load(join(path, ACTOR_NET_FILENAME), map_location=self.device, weights_only=True)
         )
         self.policy_network.eval()
         self.critic_network.load_model_weights(path)

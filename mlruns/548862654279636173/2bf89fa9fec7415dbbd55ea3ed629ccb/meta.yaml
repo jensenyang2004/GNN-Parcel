@@ -1,0 +1,14 @@
+artifact_uri: /Users/yangjingcheng/Workspaces/DRL/parcel/mlruns/548862654279636173/2bf89fa9fec7415dbbd55ea3ed629ccb/artifacts
+end_time: 1779173621347
+entry_point_name: ''
+experiment_id: '548862654279636173'
+lifecycle_stage: active
+run_id: 2bf89fa9fec7415dbbd55ea3ed629ccb
+run_name: ambitious-auk-95
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779161916645
+status: 3
+tags: []
+user_id: yangjingcheng

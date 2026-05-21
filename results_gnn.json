@@ -1,0 +1,219 @@
+{
+  "model_dir": "output/gnn2",
+  "critic_type": "gnn",
+  "n_episodes": 100,
+  "time_limit": 256,
+  "seed": 42,
+  "results": {
+    "random-64-64-10.map|size=32|agents=4": {
+      "n_valid": 100,
+      "cr_mean": 0.9175000190734863,
+      "cr_std": 0.154333233833313,
+      "sr_mean": 0.74,
+      "sr_std": 0.4386342439892262
+    },
+    "random-64-64-10.map|size=48|agents=4": {
+      "n_valid": 100,
+      "cr_mean": 0.9024999737739563,
+      "cr_std": 0.16917076706886292,
+      "sr_mean": 0.71,
+      "sr_std": 0.4537620521815371
+    },
+    "random-64-64-10.map|size=64|agents=4": {
+      "n_valid": 100,
+      "cr_mean": 0.8575000166893005,
+      "cr_std": 0.17049559950828552,
+      "sr_mean": 0.53,
+      "sr_std": 0.49909918853871116
+    },
+    "random-64-64-10.map|size=32|agents=8": {
+      "n_valid": 100,
+      "cr_mean": 0.9350000023841858,
+      "cr_std": 0.111074298620224,
+      "sr_mean": 0.63,
+      "sr_std": 0.4828043081829324
+    },
+    "random-64-64-10.map|size=48|agents=8": {
+      "n_valid": 100,
+      "cr_mean": 0.8987500071525574,
+      "cr_std": 0.10996447503566742,
+      "sr_mean": 0.43,
+      "sr_std": 0.4950757517794625
+    },
+    "random-64-64-10.map|size=64|agents=8": {
+      "n_valid": 100,
+      "cr_mean": 0.8587499856948853,
+      "cr_std": 0.14540353417396545,
+      "sr_mean": 0.39,
+      "sr_std": 0.4877499359302879
+    },
+    "random-64-64-10.map|size=32|agents=16": {
+      "n_valid": 100,
+      "cr_mean": 0.921875,
+      "cr_std": 0.08356089144945145,
+      "sr_mean": 0.36,
+      "sr_std": 0.48
+    },
+    "random-64-64-10.map|size=48|agents=16": {
+      "n_valid": 100,
+      "cr_mean": 0.8881250023841858,
+      "cr_std": 0.09734562784433365,
+      "sr_mean": 0.23,
+      "sr_std": 0.4208325082500163
+    },
+    "random-64-64-10.map|size=64|agents=16": {
+      "n_valid": 100,
+      "cr_mean": 0.8012499809265137,
+      "cr_std": 0.13386677205562592,
+      "sr_mean": 0.11,
+      "sr_std": 0.31288975694324034
+    },
+    "random-64-64-10.map|size=32|agents=32": {
+      "n_valid": 100,
+      "cr_mean": 0.9103124737739563,
+      "cr_std": 0.05549053102731705,
+      "sr_mean": 0.1,
+      "sr_std": 0.30000000000000004
+    },
+    "random-64-64-10.map|size=48|agents=32": {
+      "n_valid": 100,
+      "cr_mean": 0.8799999952316284,
+      "cr_std": 0.08205372095108032,
+      "sr_mean": 0.05,
+      "sr_std": 0.21794494717703367
+    },
+    "random-64-64-10.map|size=64|agents=32": {
+      "n_valid": 100,
+      "cr_mean": 0.7715625166893005,
+      "cr_std": 0.1337335705757141,
+      "sr_mean": 0.02,
+      "sr_std": 0.13999999999999999
+    },
+    "random-64-64-10.map|size=32|agents=64": {
+      "n_valid": 100,
+      "cr_mean": 0.8856250047683716,
+      "cr_std": 0.05710632726550102,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    },
+    "random-64-64-10.map|size=48|agents=64": {
+      "n_valid": 100,
+      "cr_mean": 0.8589062690734863,
+      "cr_std": 0.07343600690364838,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    },
+    "random-64-64-10.map|size=64|agents=64": {
+      "n_valid": 100,
+      "cr_mean": 0.735156238079071,
+      "cr_std": 0.10549768805503845,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    },
+    "warehouse.map|size=32|agents=4": {
+      "n_valid": 100,
+      "cr_mean": 0.9325000047683716,
+      "cr_std": 0.14077909290790558,
+      "sr_mean": 0.79,
+      "sr_std": 0.40730823708832603
+    },
+    "warehouse.map|size=48|agents=4": {
+      "n_valid": 100,
+      "cr_mean": 0.9549999833106995,
+      "cr_std": 0.1430908739566803,
+      "sr_mean": 0.89,
+      "sr_std": 0.31288975694324034
+    },
+    "warehouse.map|size=64|agents=4": {
+      "n_valid": 100,
+      "cr_mean": 0.9399999976158142,
+      "cr_std": 0.13285329937934875,
+      "sr_mean": 0.81,
+      "sr_std": 0.39230090491866065
+    },
+    "warehouse.map|size=32|agents=8": {
+      "n_valid": 100,
+      "cr_mean": 0.8812500238418579,
+      "cr_std": 0.13961441814899445,
+      "sr_mean": 0.46,
+      "sr_std": 0.49839743177508444
+    },
+    "warehouse.map|size=48|agents=8": {
+      "n_valid": 100,
+      "cr_mean": 0.9325000047683716,
+      "cr_std": 0.12676256895065308,
+      "sr_mean": 0.72,
+      "sr_std": 0.4489988864128729
+    },
+    "warehouse.map|size=64|agents=8": {
+      "n_valid": 100,
+      "cr_mean": 0.90625,
+      "cr_std": 0.13621559739112854,
+      "sr_mean": 0.62,
+      "sr_std": 0.48538644398046393
+    },
+    "warehouse.map|size=32|agents=16": {
+      "n_valid": 100,
+      "cr_mean": 0.8424999713897705,
+      "cr_std": 0.11506792157888412,
+      "sr_mean": 0.15,
+      "sr_std": 0.3570714214271425
+    },
+    "warehouse.map|size=48|agents=16": {
+      "n_valid": 100,
+      "cr_mean": 0.8681250214576721,
+      "cr_std": 0.12018702179193497,
+      "sr_mean": 0.23,
+      "sr_std": 0.4208325082500163
+    },
+    "warehouse.map|size=64|agents=16": {
+      "n_valid": 100,
+      "cr_mean": 0.878125011920929,
+      "cr_std": 0.11604652553796768,
+      "sr_mean": 0.25,
+      "sr_std": 0.4330127018922193
+    },
+    "warehouse.map|size=32|agents=32": {
+      "n_valid": 100,
+      "cr_mean": 0.7253124713897705,
+      "cr_std": 0.12129630893468857,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    },
+    "warehouse.map|size=48|agents=32": {
+      "n_valid": 100,
+      "cr_mean": 0.7987499833106995,
+      "cr_std": 0.1112183928489685,
+      "sr_mean": 0.01,
+      "sr_std": 0.09949874371066199
+    },
+    "warehouse.map|size=64|agents=32": {
+      "n_valid": 100,
+      "cr_mean": 0.8128125071525574,
+      "cr_std": 0.11713498085737228,
+      "sr_mean": 0.03,
+      "sr_std": 0.17058722109231983
+    },
+    "warehouse.map|size=32|agents=64": {
+      "n_valid": 100,
+      "cr_mean": 0.6254687309265137,
+      "cr_std": 0.09751439839601517,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    },
+    "warehouse.map|size=48|agents=64": {
+      "n_valid": 100,
+      "cr_mean": 0.6876562237739563,
+      "cr_std": 0.0890897661447525,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    },
+    "warehouse.map|size=64|agents=64": {
+      "n_valid": 100,
+      "cr_mean": 0.7015625238418579,
+      "cr_std": 0.10028037428855896,
+      "sr_mean": 0.0,
+      "sr_std": 0.0
+    }
+  }
+}
