@@ -57,7 +57,7 @@ class MAPFGridWorld(CollisionGridWorld):
         y_direction = torch.sign(dy).to(dtype=INT_TYPE)+half_size
         obs[self.agent_ids,0, x_direction, half_size] = abs_dx/euclidean_distance
         obs[self.agent_ids,0, half_size, y_direction] = abs_dy/euclidean_distance
-        obs[self.agent_ids,0, half_size, half_size] = manhattan_distance.to(dtype=FLOAT_TYPE)
+        obs[self.agent_ids,0, half_size, half_size] = manhattan_distance.to(dtype=FLOAT_TYPE) / (self.rows + self.columns)
         obs[goal_in_sight,1,dx[goal_in_sight]+half_size, dy[goal_in_sight]+half_size] = 1
 
         # Scan surrounding obstacles and boundaries
@@ -78,7 +78,7 @@ class MAPFGridWorld(CollisionGridWorld):
             neighbor_condition = is_agents_position.view(self.nr_agents, self.observation_size, self.observation_size)
             obs[self.agent_ids,3,:,:] = torch.where(neighbor_condition, 1.0, 0.0)
             flattened_view = obs[self.agent_ids,3].view(-1)
-            flattened_view[neighbor_condition.view(-1)] = manhattan_distance[neighbor_ids].to(FLOAT_TYPE) + 1
+            flattened_view[neighbor_condition.view(-1)] = (manhattan_distance[neighbor_ids].to(FLOAT_TYPE) + 1) / (self.rows + self.columns)
             obs[self.agent_ids,3,:,:] = flattened_view.view(self.nr_agents, self.observation_size, self.observation_size)
             obs[self.agent_ids, 3, half_size, half_size] = 0.0
             obs[self.agent_ids,0,:,:] = torch.where(obs[self.agent_ids,3,:,:] > 0, zero_obs, obs[self.agent_ids,0,:,:])
@@ -92,7 +92,7 @@ class MAPFGridWorld(CollisionGridWorld):
             goal_condition = is_goal_position.view(self.nr_agents, self.observation_size, self.observation_size)
             obs[self.agent_ids,4,:,:] = torch.where(goal_condition, 1.0, 0.0)
             flattened_view = obs[self.agent_ids,4].view(-1)
-            distances = manhattan_distance[goal_ids].to(FLOAT_TYPE) + 1
+            distances = (manhattan_distance[goal_ids].to(FLOAT_TYPE) + 1) / (self.rows + self.columns)
             flattened_view[goal_condition.view(-1)] = distances
             obs[self.agent_ids,4,:,:] = flattened_view.view(self.nr_agents, self.observation_size, self.observation_size)
             max_distance = distances.max()
