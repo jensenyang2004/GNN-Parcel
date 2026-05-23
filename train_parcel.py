@@ -236,6 +236,8 @@ def run_training_parcel(train_envs, test_envs, controller, params, logger=None):
     total_time = 0.0
     prev_total_time = 0.0
     training_result = {COMPLETION_RATE: 0.0, SUCCESS_RATE_VARIANCE: 0.0}
+    best_test_cr = -float("inf")
+    best_epoch = -1
 
     for epoch in range(nr_epochs + 1):
         start = time.time()
@@ -276,6 +278,15 @@ def run_training_parcel(train_envs, test_envs, controller, params, logger=None):
             completion_rates.append(float(test_result[COMPLETION_RATE]))
             training_times.append(training_time)
 
+            # Save best-by-test-CR snapshot to <directory>/best/
+            if directory and test_result[COMPLETION_RATE] > best_test_cr:
+                best_test_cr = float(test_result[COMPLETION_RATE])
+                best_epoch = epoch
+                best_dir = os.path.join(directory, "best")
+                os.makedirs(best_dir, exist_ok=True)
+                controller.save_model_weights(best_dir)
+                print(f"  [Best test CR={best_test_cr:.3f} at epoch {epoch} -> {best_dir}]")
+
         if epoch > 0 and epoch % 500 == 0 and directory:
             os.makedirs(directory, exist_ok=True)
             controller.save_model_weights(directory)
@@ -287,12 +298,17 @@ def run_training_parcel(train_envs, test_envs, controller, params, logger=None):
         SUCCESS_RATE: success_rates,
         COMPLETION_RATE: completion_rates,
         TRAINING_TIME: training_times,
+        "best_test_cr": best_test_cr if best_epoch >= 0 else None,
+        "best_epoch": best_epoch if best_epoch >= 0 else None,
     }
     if directory:
         os.makedirs(directory, exist_ok=True)
         controller.save_model_weights(directory)
         save_json(os.path.join(directory, "results.json"), result)
-        print(f"\nModel saved to: {directory}")
+        print(f"\nLatest model saved to: {directory}")
+        if best_epoch >= 0:
+            print(f"Best model (test CR={best_test_cr:.3f}, epoch {best_epoch}) "
+                  f"saved to: {os.path.join(directory, 'best')}")
     return result
 
 
