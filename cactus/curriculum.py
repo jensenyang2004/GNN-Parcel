@@ -47,6 +47,15 @@ class CACTUSCurriculum(Curriculum):
         return self.radius
 
     def update_curriculum(self, objective_value, variance):
+        if hasattr(objective_value, "detach"):
+            objective_value = float(objective_value.detach().cpu().item())
+        else:
+            objective_value = float(objective_value)
+        if hasattr(variance, "detach"):
+            variance = float(variance.detach().cpu().item())
+        else:
+            variance = float(variance)
+
         # Keep track of progress
         self.objective_values.append(objective_value)
         self.value_count += 1
@@ -54,7 +63,7 @@ class CACTUSCurriculum(Curriculum):
         self.total_sum_squared += (objective_value*objective_value)
         if self.value_count >= self.sliding_window_size:
             mean = self.total_sum/self.sliding_window_size
-            stddev = numpy.sqrt(self.total_sum_squared/self.sliding_window_size - mean*mean)
+            stddev = numpy.sqrt(max(0.0, self.total_sum_squared/self.sliding_window_size - mean*mean))
             oldest_value = self.objective_values.pop(0)
             self.total_sum -= oldest_value
             self.total_sum_squared -= (oldest_value*oldest_value)

@@ -312,6 +312,15 @@ def run_training_parcel(train_envs, test_envs, controller, params, logger=None):
     return result
 
 
+def resolve_device(device_name):
+    """Resolve a CLI device string, falling back cleanly if CUDA is unavailable."""
+    requested = device_name.lower()
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[Device] Requested {device_name}, but CUDA is not available. Falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
 # -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
@@ -381,6 +390,8 @@ def main():
                         help="Disable MLflow logging")
 
     # Misc
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Torch device to use, e.g. cuda, cuda:0, or cpu (default: cuda)")
     parser.add_argument("--output_dir", type=str, default="output/parcel")
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
@@ -391,7 +402,7 @@ def main():
     numpy.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     print(f"Device: {device}")
 
     # --- Resolve map paths ---
