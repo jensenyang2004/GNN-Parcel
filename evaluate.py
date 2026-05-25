@@ -113,11 +113,20 @@ def make_env(obstacle_list, nr_agents, time_limit, device):
 # Single episode runner
 # -----------------------------------------------------------------------
 
-def run_episode(env, controller):
+def run_episode(env, controller, greedy=True):
+    """
+    Run one greedy or stochastic episode.
+
+    greedy=True  -> argmax of (masked) action logits   (deterministic baseline)
+    greedy=False -> sample from softmax(masked logits) (breaks symmetric ties
+                    that cause deadlocks in dense corridors)
+
+    Goal-reached agents are always frozen with WAIT, independent of greedy.
+    """
     obs = env.reset()
     done = False
     while not done:
-        action = controller.joint_policy(obs, greedy=True)
+        action = controller.joint_policy(obs, greedy=greedy)
         action[env.is_terminated()] = WAIT  # freeze agents already at goal
         obs, _, _, _, info = env.step(action)
         done = env.is_done_all()
@@ -130,7 +139,7 @@ def run_episode(env, controller):
 # Per-configuration evaluation
 # -----------------------------------------------------------------------
 
-def evaluate_config(base_map, nr_agents, controller, n_episodes, time_limit, device):
+def evaluate_config(base_map, nr_agents, controller, n_episodes, time_limit, device, greedy=True):
     """
     Run n_episodes on the FULL-size base_map with nr_agents agents.
     Each episode re-randomizes start/goal positions via env.reset().
@@ -145,7 +154,7 @@ def evaluate_config(base_map, nr_agents, controller, n_episodes, time_limit, dev
     crs, srs = [], []
     for _ in range(n_episodes):
         try:
-            cr, sr = run_episode(env, controller)
+            cr, sr = run_episode(env, controller, greedy=greedy)
             crs.append(cr)
             srs.append(sr)
         except Exception:
@@ -230,6 +239,9 @@ def main():
                         help="Episodes per (map, n_agents) configuration")
     parser.add_argument("--time_limit", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--stochastic", action="store_true",
+                        help="Sample actions from softmax(logits) instead of argmax. "
+                             "Helps break symmetric ties / corridor deadlocks in dense MAPF.")
 
     # Output
     parser.add_argument("--output", type=str, default=None,
@@ -259,9 +271,11 @@ def main():
     # --- Summary of sweep ---
     total_configs = len(args.maps) * len(args.agent_counts)
     total_episodes = total_configs * args.n_episodes
+    action_mode = "stochastic (sampled)" if args.stochastic else "greedy (argmax)"
     print(f"\nSweep: {len(args.maps)} maps × {len(args.agent_counts)} agent counts"
           f" = {total_configs} configs × {args.n_episodes} episodes"
-          f" = {total_episodes} total episodes (full-size maps, no cropping)\n")
+          f" = {total_episodes} total episodes (full-size maps, no cropping)")
+    print(f"Action mode: {action_mode}\n")
 
     # --- Evaluate each config ---
     results = {}
@@ -285,7 +299,8 @@ def main():
             t1 = time.time()
             r = evaluate_config(
                 base_map, nr_agents,
-                controller, args.n_episodes, args.time_limit, device
+                controller, args.n_episodes, args.time_limit, device,
+                greedy=not args.stochastic,
             )
             elapsed = time.time() - t1
 
@@ -321,6 +336,7 @@ def main():
                 "n_episodes": args.n_episodes,
                 "time_limit": args.time_limit,
                 "seed": args.seed,
+                "action_mode": "stochastic" if args.stochastic else "greedy",
                 "results": serializable,
             }, f, indent=2)
         print(f"Results saved to: {args.output}")

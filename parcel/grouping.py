@@ -211,6 +211,40 @@ def build_edge_weights(groups, start_positions, ralloc, N, device):
     return features
 
 
+def build_edge_weights_batched(positions_batch, ralloc, device):
+    """
+    Vectorized edge weight computation for all timesteps at once.
+
+    positions_batch: IntTensor [T, N, 2] — (row, col) per agent per step
+    ralloc:          int, current allocation radius (used as distance normalizer)
+
+    Returns: FloatTensor [T, N, N, 3] — (dr, dc, w) per directed edge per timestep
+        dr[t,i,j] = (row_j - row_i) / (2*ralloc)
+        dc[t,i,j] = (col_j - col_i) / (2*ralloc)
+        w[t,i,j]  = clamp(1 - |dr| - |dc|, 0)  — proximity (0 for distant pairs)
+    Self-loops: dr=dc=0, w=1.
+    """
+    T, N, _ = positions_batch.shape
+    denom = float(max(2 * ralloc, 1))
+
+    rows = positions_batch[:, :, 0].float()  # [T, N]
+    cols = positions_batch[:, :, 1].float()  # [T, N]
+
+    # rows.unsqueeze(1) [T,1,N], rows.unsqueeze(2) [T,N,1]
+    # result[t,i,j] = rows[t,j] - rows[t,i]
+    dr = (rows.unsqueeze(1) - rows.unsqueeze(2)) / denom  # [T, N, N]
+    dc = (cols.unsqueeze(1) - cols.unsqueeze(2)) / denom  # [T, N, N]
+    w  = (1.0 - dr.abs() - dc.abs()).clamp(min=0.0)       # [T, N, N]
+
+    # Self-loops: zero direction, max proximity
+    eye = torch.eye(N, device=device, dtype=torch.bool)
+    dr = dr.masked_fill(eye.unsqueeze(0), 0.0)
+    dc = dc.masked_fill(eye.unsqueeze(0), 0.0)
+    w  =  w.masked_fill(eye.unsqueeze(0), 1.0)
+
+    return torch.stack([dr, dc, w], dim=-1)  # [T, N, N, 3]
+
+
 def group_summary(groups, N):
     """
     Human-readable summary of current grouping.

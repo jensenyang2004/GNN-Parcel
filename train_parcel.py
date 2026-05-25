@@ -157,6 +157,8 @@ def run_episode_parcel(env, controller, training_mode=True):
     done = False
     info = {ENV_COMPLETION_RATE: 0.0}
     while not done:
+        if training_mode:
+            controller.record_step_positions(env.current_positions)
         greedy = not training_mode
         joint_action = controller.joint_policy(obs, greedy=greedy)
         if not training_mode:

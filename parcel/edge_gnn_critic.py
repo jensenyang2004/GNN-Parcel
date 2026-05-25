@@ -40,17 +40,17 @@ EDGE_GNN_EMBED_DIM = "edge_gnn_embed_dim"
 EDGE_GNN_EDGE_DIM  = "edge_gnn_edge_dim"
 
 
-def _normalize_edge_weights(W, device):
+def _normalize_edge_weights(W):
     """
-    Degree-normalize a soft edge weight matrix (already includes self-loops).
-    D^{-1/2} W D^{-1/2}, with D_ii = sum_j W[i,j].
-    Agents with zero degree (isolated, no self-loop) get 0 rows/cols.
+    Degree-normalize a soft edge weight matrix.
+    D^{-1/2} W D^{-1/2}, with D_i = sum_j W[i,j].
+    W can be [N, N] or [T, N, N]; normalization is applied along the last two dims.
     """
-    D = W.sum(dim=1)                      # [N]
+    D = W.sum(dim=-1)
     D_inv_sqrt = D.pow(-0.5)
-    D_inv_sqrt[D_inv_sqrt.isinf()] = 0.0
-    W_norm = D_inv_sqrt.unsqueeze(1) * W * D_inv_sqrt.unsqueeze(0)
-    return W_norm
+    D_inv_sqrt = D_inv_sqrt.masked_fill(D_inv_sqrt.isinf(), 0.0)
+    # unsqueeze(-1) → row scale, unsqueeze(-2) → col scale; works for both 2D and 3D
+    return D_inv_sqrt.unsqueeze(-1) * W * D_inv_sqrt.unsqueeze(-2)
 
 
 class EdgeGCNLayer(nn.Module):
@@ -76,40 +76,30 @@ class EdgeGCNLayer(nn.Module):
     def forward(self, H, W_norm, edge_weights):
         """
         Args:
-            H:            FloatTensor [batch, N, embed_dim]
-            W_norm:       FloatTensor [N, N]  — degree-normalized soft weights
-            edge_weights: FloatTensor [N, N]  — raw soft weights (for embedding)
+            H:            FloatTensor [T, N, embed_dim]
+            W_norm:       FloatTensor [T, N, N]  — degree-normalized soft weights
+            edge_weights: FloatTensor [T, N, N, 3]  — (dr, dc, w) per timestep
 
         Returns:
-            FloatTensor [batch, N, embed_dim]
-
-        Efficient factored implementation avoids [batch, N, N, embed_dim] tensors.
-
-        Original: aggregated[i] = sum_j w[i,j] * W_msg @ concat(h_j, e_ij)
-        Factored into three batch-independent-or-small terms:
-          node part:  (W_norm @ H) @ W_h.T          [batch, N, embed_dim]
-          edge part:  (W_norm ⊙ E_transformed).sum(j)  [N, embed_dim], broadcast
-          bias part:  row_sums[i] * bias              [N, embed_dim], broadcast
+            FloatTensor [T, N, embed_dim]
         """
-        batch, N, embed_dim = H.shape
+        T, N, embed_dim = H.shape
 
-        # Split msg_linear weights: [out=embed_dim, in=embed_dim+edge_dim]
         W_h = self.msg_linear.weight[:, :embed_dim]   # [embed_dim, embed_dim]
         W_e = self.msg_linear.weight[:, embed_dim:]   # [embed_dim, edge_dim]
 
-        # Node part: aggregate neighbors then transform — O(batch × N × embed)
-        AH = torch.bmm(W_norm.unsqueeze(0).expand(batch, -1, -1), H)  # [batch, N, embed]
-        node_out = AH @ W_h.t()                                         # [batch, N, embed]
+        # Node part: O(T × N × embed)
+        AH = torch.bmm(W_norm, H)       # [T, N, embed]
+        node_out = AH @ W_h.t()         # [T, N, embed]
 
-        # Edge part: embed (dr, dc, w) features then aggregate — O(N² × edge_dim), no batch axis
-        edge_embeds = self.edge_embed(edge_weights)                     # [N, N, 3] → [N, N, edge_dim]
-        edge_out = (W_norm.unsqueeze(-1) * (edge_embeds @ W_e.t())).sum(dim=1)  # [N, embed]
+        # Edge part: embed (dr, dc, w) then aggregate over j
+        edge_embeds = self.edge_embed(edge_weights)                               # [T, N, N, edge_dim]
+        edge_out = (W_norm.unsqueeze(-1) * (edge_embeds @ W_e.t())).sum(dim=-2)  # [T, N, embed]
 
-        # Bias part: each (i,j) pair contributes w[i,j]*bias, so sum = row_sum * bias
         if self.msg_linear.bias is not None:
-            bias_out = W_norm.sum(dim=1, keepdim=True) * self.msg_linear.bias  # [N, embed]
-            return F.elu(node_out + edge_out.unsqueeze(0) + bias_out.unsqueeze(0))
-        return F.elu(node_out + edge_out.unsqueeze(0))
+            bias_out = W_norm.sum(dim=-1, keepdim=True) * self.msg_linear.bias   # [T, N, embed]
+            return F.elu(node_out + edge_out + bias_out)
+        return F.elu(node_out + edge_out)
 
 
 class EdgeGNNCriticModule(nn.Module):
@@ -149,32 +139,32 @@ class EdgeGNNCriticModule(nn.Module):
     def forward(self, joint_obs, W_norm, edge_weights):
         """
         Args:
-            joint_obs:    FloatTensor [batch*N, input_shape]
-            W_norm:       FloatTensor [N, N]  — normalized adjacency
-            edge_weights: FloatTensor [N, N]  — raw soft weights
+            joint_obs:    FloatTensor [T*N, input_shape]
+            W_norm:       FloatTensor [T, N, N]  — normalized adjacency per timestep
+            edge_weights: FloatTensor [T, N, N, 3]  — (dr, dc, w) per timestep
 
         Returns:
-            Q values: FloatTensor [batch*N, nr_actions]
+            Q values: FloatTensor [T*N, nr_actions]
         """
         N = self.nr_agents
-        batch = joint_obs.numel() // (N * self.input_shape)
+        T = joint_obs.shape[0] // N
 
-        H = self.node_encoder(joint_obs.view(batch * N, self.input_shape))
-        H = H.view(batch, N, -1)
+        H = self.node_encoder(joint_obs.view(T * N, self.input_shape))
+        H = H.view(T, N, -1)
 
         for layer in self.gcn_layers:
             H = layer(H, W_norm, edge_weights)
 
-        return self.output_layer(H).view(batch * N, self.nr_actions)
+        return self.output_layer(H).view(T * N, self.nr_actions)
 
 
 class EdgeGNNCritic:
     """
     Edge-encoded GCN critic. Same interface as GNNCritic and MaskedAttentionCritic.
 
-    Requires two tensors per epoch:
-        grouping_mask   [N, N]     — 0 / -inf  (which pairs are in same group)
-        edge_weights    [N, N, 3]  — (dr, dc, w) features from build_edge_weights()
+    Requires one tensor per epoch (set before train() is called):
+        edge_weights    [T, N, N, 3]  — (dr, dc, w) per step from build_edge_weights_batched()
+    where T = total timesteps across all episodes this epoch.
     """
 
     def __init__(self, params):
@@ -189,33 +179,21 @@ class EdgeGNNCritic:
             self.q_net.parameters(), lr=self.learning_rate
         )
 
-        self._edge_weights_raw  = None   # [N, N] soft weights
-        self._w_norm_cache      = None   # [N, N] degree-normalized
+        self._edge_weights = None   # [T, N, N, 3]
+        self._w_norm       = None   # [T, N, N] degree-normalized
 
     def set_grouping_mask(self, mask):
-        """Called by controller — mask not directly used here (edge_weights carry the info)."""
+        """Called by controller — grouping is encoded in edge_weights, mask unused here."""
         pass
 
     def set_edge_weights(self, edge_weights):
         """
-        Called by PARCELController after each epoch alongside set_grouping_mask.
-        edge_weights: FloatTensor [N, N, 3] from build_edge_weights() — (dr, dc, w).
-        W_norm is degree-normalized from the proximity channel (w = index 2).
+        Called by PARCELController before each train() call.
+        edge_weights: FloatTensor [T, N, N, 3] from build_edge_weights_batched().
+        W_norm is computed from the proximity channel (index 2).
         """
-        self._edge_weights_raw = edge_weights.to(self.device)
-        self._w_norm_cache = _normalize_edge_weights(
-            self._edge_weights_raw[:, :, 2], self.device
-        )
-
-    def _get_weights(self):
-        if self._edge_weights_raw is None:
-            # Default: fully connected, no direction, uniform proximity
-            N = self.nr_agents
-            W_feats = torch.zeros(N, N, 3, device=self.device)
-            W_feats[:, :, 2] = 1.0  # proximity channel = 1
-            self._edge_weights_raw = W_feats
-            self._w_norm_cache = _normalize_edge_weights(W_feats[:, :, 2], self.device)
-        return self._w_norm_cache, self._edge_weights_raw
+        self._edge_weights = edge_weights.to(self.device)
+        self._w_norm = _normalize_edge_weights(self._edge_weights[..., 2])
 
     def get_parameter_count(self):
         return sum(p.numel() for p in self.q_net.parameters() if p.requires_grad)
@@ -233,13 +211,11 @@ class EdgeGNNCritic:
         self.q_net.eval()
 
     def counterfactual_baseline(self, observations, actions, probs):
-        W_norm, E = self._get_weights()
-        q_values = self.q_net(observations, W_norm, E)
+        q_values = self.q_net(observations, self._w_norm, self._edge_weights)
         return (probs * q_values).sum(dim=-1).detach()
 
     def train(self, observations, actions, targets):
-        W_norm, E = self._get_weights()
-        q_values = self.q_net(observations, W_norm, E)
+        q_values = self.q_net(observations, self._w_norm, self._edge_weights)
 
         q_taken = q_values.gather(1, actions.view(-1, 1)).squeeze(1)
         loss = F.mse_loss(q_taken, targets.view(-1))

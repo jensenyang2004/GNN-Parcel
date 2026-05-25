@@ -38,7 +38,7 @@ from cactus.utils import get_param_or_default, assertEquals
 
 from parcel.grouping import (
     compute_groups, build_grouping_mask, union_grouping_masks,
-    build_edge_weights, group_summary
+    build_edge_weights_batched, group_summary
 )
 from parcel.attention_critic import MaskedAttentionCritic
 from parcel.gnn_critic import GNNCritic
@@ -96,9 +96,9 @@ class PARCELController(Controller):
 
         # --- Spatial grouping state ---
         self.episode_masks = []           # Per-episode grouping masks [N, N]
-        self.episode_start_positions = [] # Per-episode start positions (for edge weights)
         self.episode_groups = []          # Per-episode groups (cached to avoid recompute)
         self.current_start_positions = None
+        self.step_positions_buffer = []   # [N, 2] per training step, for real-time edge weights
 
         # Map properties (needed for BFS in grouping)
         self.ralloc = get_param_or_default(params, PARCEL_RALLOC, 2)
@@ -132,7 +132,6 @@ class PARCELController(Controller):
             start_positions: list of (row, col) tuples, length N
         """
         self.current_start_positions = start_positions
-        self.episode_start_positions.append(start_positions)
 
         if self.rows is None or self.obstacle_map is None:
             groups = [set(range(self.nr_agents))]
@@ -149,6 +148,14 @@ class PARCELController(Controller):
 
         self.episode_masks.append(mask)
         self.episode_groups.append(groups)
+
+    def record_step_positions(self, positions):
+        """
+        Call at each training step with current agent positions [N, 2].
+        Positions are stored per-step and used to build real-time edge weights
+        for the edge_gnn critic at the end of the epoch.
+        """
+        self.step_positions_buffer.append(positions.to(self.device))
 
     def _build_epoch_mask(self):
         """
@@ -225,16 +232,13 @@ class PARCELController(Controller):
         epoch_mask = self._build_epoch_mask()
         self.critic_network.set_grouping_mask(epoch_mask)
 
-        if self.critic_type == "edge_gnn" and self.episode_start_positions:
-            # Average soft edge weights across all episodes this epoch.
-            # Use cached episode_groups to avoid recomputing BFS/union-find.
-            all_edge_w = [
-                build_edge_weights(groups, start_pos, self.ralloc,
-                                   self.nr_agents, self.device)
-                for groups, start_pos in zip(self.episode_groups, self.episode_start_positions)
-            ]
-            epoch_edge_weights = torch.stack(all_edge_w).mean(dim=0)
-            self.critic_network.set_edge_weights(epoch_edge_weights)
+        if self.critic_type == "edge_gnn" and self.step_positions_buffer:
+            # Build per-step edge weights from actual agent positions at each timestep.
+            positions_batch = torch.stack(self.step_positions_buffer)  # [T, N, 2]
+            edge_weights = build_edge_weights_batched(
+                positions_batch, self.ralloc, self.device
+            )
+            self.critic_network.set_edge_weights(edge_weights)
 
         if self.verbose:
             connected = (epoch_mask == 0.0).sum().item()
@@ -287,8 +291,8 @@ class PARCELController(Controller):
 
         # --- Step 5: Clear episode state for next epoch ---
         self.episode_masks.clear()
-        self.episode_start_positions.clear()
         self.episode_groups.clear()
+        self.step_positions_buffer.clear()
 
     def _ppo_loss(self, advantages, probs, actions, old_probs):
         """
