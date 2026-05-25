@@ -38,7 +38,7 @@ from cactus.utils import get_param_or_default, assertEquals
 
 from parcel.grouping import (
     compute_groups, build_grouping_mask, union_grouping_masks,
-    build_edge_weights_batched, group_summary
+    group_summary
 )
 from parcel.attention_critic import MaskedAttentionCritic
 from parcel.gnn_critic import GNNCritic
@@ -233,12 +233,9 @@ class PARCELController(Controller):
         self.critic_network.set_grouping_mask(epoch_mask)
 
         if self.critic_type == "edge_gnn" and self.step_positions_buffer:
-            # Build per-step edge weights from actual agent positions at each timestep.
-            positions_batch = torch.stack(self.step_positions_buffer)  # [T, N, 2]
-            edge_weights = build_edge_weights_batched(
-                positions_batch, self.ralloc, self.device
-            )
-            self.critic_network.set_edge_weights(edge_weights)
+            # Pass per-step positions; EdgeGNNCritic builds realtime edge weights in chunks.
+            positions_batch = torch.stack(self.step_positions_buffer, dim=0)  # [T, N, 2]
+            self.critic_network.set_positions(positions_batch, self.ralloc)
 
         if self.verbose:
             connected = (epoch_mask == 0.0).sum().item()

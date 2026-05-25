@@ -34,10 +34,12 @@ from cactus.constants import (
 )
 from cactus.utils import assertContains, get_param_or_default
 from parcel.gnn_critic import _make_node_encoder  # reuse identical encoder
+from parcel.grouping import build_edge_weights_batched
 
 EDGE_GNN_NR_LAYERS = "edge_gnn_nr_layers"
 EDGE_GNN_EMBED_DIM = "edge_gnn_embed_dim"
 EDGE_GNN_EDGE_DIM  = "edge_gnn_edge_dim"
+EDGE_GNN_CHUNK_STEPS = "edge_gnn_chunk_steps"
 
 
 def _normalize_edge_weights(W):
@@ -92,9 +94,10 @@ class EdgeGCNLayer(nn.Module):
         AH = torch.bmm(W_norm, H)       # [T, N, embed]
         node_out = AH @ W_h.t()         # [T, N, embed]
 
-        # Edge part: embed (dr, dc, w) then aggregate over j
+        # Edge part: embed (dr, dc, w), aggregate over j, then project.
         edge_embeds = self.edge_embed(edge_weights)                               # [T, N, N, edge_dim]
-        edge_out = (W_norm.unsqueeze(-1) * (edge_embeds @ W_e.t())).sum(dim=-2)  # [T, N, embed]
+        edge_agg = (W_norm.unsqueeze(-1) * edge_embeds).sum(dim=-2)               # [T, N, edge_dim]
+        edge_out = edge_agg @ W_e.t()                                             # [T, N, embed]
 
         if self.msg_linear.bias is not None:
             bias_out = W_norm.sum(dim=-1, keepdim=True) * self.msg_linear.bias   # [T, N, embed]
@@ -162,9 +165,9 @@ class EdgeGNNCritic:
     """
     Edge-encoded GCN critic. Same interface as GNNCritic and MaskedAttentionCritic.
 
-    Requires one tensor per epoch (set before train() is called):
-        edge_weights    [T, N, N, 3]  — (dr, dc, w) per step from build_edge_weights_batched()
-    where T = total timesteps across all episodes this epoch.
+    The realtime training path stores per-step positions for the epoch and builds
+    edge weights in timestep chunks. set_edge_weights() remains available for
+    callers that still pass precomputed edge weights.
     """
 
     def __init__(self, params):
@@ -173,14 +176,17 @@ class EdgeGNNCritic:
         self.nr_actions  = params[ENV_NR_ACTIONS]
         self.grad_norm_clip = get_param_or_default(params, "grad_norm_clip", 1.0)
         self.learning_rate  = get_param_or_default(params, "learning_rate", 0.001)
+        self.chunk_steps = max(1, int(get_param_or_default(params, EDGE_GNN_CHUNK_STEPS, 16)))
 
         self.q_net = EdgeGNNCriticModule(params).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.q_net.parameters(), lr=self.learning_rate
         )
 
-        self._edge_weights = None   # [T, N, N, 3]
-        self._w_norm       = None   # [T, N, N] degree-normalized
+        self._edge_weights = None      # [T, N, N, 3]
+        self._w_norm       = None      # [T, N, N] degree-normalized
+        self._positions_batch = None   # [T, N, 2]
+        self._ralloc = None
 
     def set_grouping_mask(self, mask):
         """Called by controller — grouping is encoded in edge_weights, mask unused here."""
@@ -194,6 +200,52 @@ class EdgeGNNCritic:
         """
         self._edge_weights = edge_weights.to(self.device)
         self._w_norm = _normalize_edge_weights(self._edge_weights[..., 2])
+        self._positions_batch = None
+        self._ralloc = None
+
+    def set_positions(self, positions_batch, ralloc):
+        """
+        Store per-step agent positions so realtime edge features can be built
+        in memory-safe timestep chunks during critic forward/training.
+        """
+        self._positions_batch = positions_batch.detach()
+        self._ralloc = ralloc
+        self._edge_weights = None
+        self._w_norm = None
+
+    def _edge_tensors_for_slice(self, start_step, end_step):
+        if self._positions_batch is not None:
+            pos = self._positions_batch[start_step:end_step].to(self.device)
+            edge_weights = build_edge_weights_batched(pos, self._ralloc, self.device)
+            w_norm = _normalize_edge_weights(edge_weights[..., 2])
+            return w_norm, edge_weights
+
+        if self._edge_weights is None or self._w_norm is None:
+            raise RuntimeError("EdgeGNNCritic requires set_positions() or set_edge_weights() before forward.")
+
+        return (
+            self._w_norm[start_step:end_step],
+            self._edge_weights[start_step:end_step],
+        )
+
+    def _forward_chunked(self, observations):
+        total_samples = observations.shape[0]
+        if total_samples % self.nr_agents != 0:
+            raise ValueError(
+                f"Expected observations length to be divisible by nr_agents={self.nr_agents}, "
+                f"got {total_samples}."
+            )
+
+        total_steps = total_samples // self.nr_agents
+        outputs = []
+        for start_step in range(0, total_steps, self.chunk_steps):
+            end_step = min(start_step + self.chunk_steps, total_steps)
+            start_sample = start_step * self.nr_agents
+            end_sample = end_step * self.nr_agents
+            obs_chunk = observations[start_sample:end_sample]
+            w_norm, edge_weights = self._edge_tensors_for_slice(start_step, end_step)
+            outputs.append(self.q_net(obs_chunk, w_norm, edge_weights))
+        return torch.cat(outputs, dim=0)
 
     def get_parameter_count(self):
         return sum(p.numel() for p in self.q_net.parameters() if p.requires_grad)
@@ -211,17 +263,45 @@ class EdgeGNNCritic:
         self.q_net.eval()
 
     def counterfactual_baseline(self, observations, actions, probs):
-        q_values = self.q_net(observations, self._w_norm, self._edge_weights)
-        return (probs * q_values).sum(dim=-1).detach()
+        with torch.no_grad():
+            q_values = self._forward_chunked(observations)
+            baseline = (probs * q_values).sum(dim=-1).detach()
+        return baseline
 
     def train(self, observations, actions, targets):
-        q_values = self.q_net(observations, self._w_norm, self._edge_weights)
-
-        q_taken = q_values.gather(1, actions.view(-1, 1)).squeeze(1)
-        loss = F.mse_loss(q_taken, targets.view(-1))
-
         self.optimizer.zero_grad()
-        loss.backward()
+
+        total_samples = observations.shape[0]
+        if total_samples % self.nr_agents != 0:
+            raise ValueError(
+                f"Expected observations length to be divisible by nr_agents={self.nr_agents}, "
+                f"got {total_samples}."
+            )
+
+        total_steps = total_samples // self.nr_agents
+        total_loss = 0.0
+        total_count = 0
+
+        for start_step in range(0, total_steps, self.chunk_steps):
+            end_step = min(start_step + self.chunk_steps, total_steps)
+            start_sample = start_step * self.nr_agents
+            end_sample = end_step * self.nr_agents
+            chunk_sample_count = end_sample - start_sample
+
+            obs_chunk = observations[start_sample:end_sample]
+            actions_chunk = actions[start_sample:end_sample]
+            targets_chunk = targets[start_sample:end_sample]
+            w_norm, edge_weights = self._edge_tensors_for_slice(start_step, end_step)
+            q_values = self.q_net(obs_chunk, w_norm, edge_weights)
+
+            q_taken = q_values.gather(1, actions_chunk.view(-1, 1)).squeeze(1)
+            loss = F.mse_loss(q_taken, targets_chunk.view(-1), reduction="mean")
+            weight = chunk_sample_count / total_samples
+            (loss * weight).backward()
+
+            total_loss += loss.item() * chunk_sample_count
+            total_count += chunk_sample_count
+
         nn.utils.clip_grad_norm_(self.q_net.parameters(), self.grad_norm_clip)
         self.optimizer.step()
-        return loss.item()
+        return total_loss / total_count

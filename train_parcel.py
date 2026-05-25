@@ -34,7 +34,10 @@ from parcel.parcel_controller import (
     PARCEL_CRITIC_TYPE
 )
 from parcel.gnn_critic import GNN_NR_LAYERS, GNN_EMBED_DIM
-from parcel.edge_gnn_critic import EDGE_GNN_NR_LAYERS, EDGE_GNN_EMBED_DIM, EDGE_GNN_EDGE_DIM
+from parcel.edge_gnn_critic import (
+    EDGE_GNN_NR_LAYERS, EDGE_GNN_EMBED_DIM, EDGE_GNN_EDGE_DIM,
+    EDGE_GNN_CHUNK_STEPS,
+)
 from parcel.mlflow_logger import PARCELLogger
 
 
@@ -384,6 +387,8 @@ def main():
                         help="GCN layers (gnn and edge_gnn)")
     parser.add_argument("--edge_dim", type=int, default=4,
                         help="Edge embedding dimension (edge_gnn only)")
+    parser.add_argument("--edge_chunk_steps", type=int, default=16,
+                        help="Number of timesteps per chunk for realtime Edge-GNN edge construction.")
 
     # MLflow
     parser.add_argument("--experiment", type=str, default="parcel_random",
@@ -463,6 +468,7 @@ def main():
         EDGE_GNN_EMBED_DIM: args.embed_dim,
         EDGE_GNN_NR_LAYERS: args.gnn_layers,
         EDGE_GNN_EDGE_DIM: args.edge_dim,
+        EDGE_GNN_CHUNK_STEPS: args.edge_chunk_steps,
         LEARNING_RATE: args.lr,
         CLIP_RATIO: args.clip_ratio,
         UPDATE_ITERATIONS: args.update_iterations,
